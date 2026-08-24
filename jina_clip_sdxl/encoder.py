@@ -3,7 +3,7 @@ import logging
 import math
 import os
 import re
-import sys
+from contextlib import ExitStack
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -14,20 +14,18 @@ from backend import memory_management
 from modules import prompt_parser
 from modules.shared import opts
 
-from .adapter import JinaToSDXLAdapterV2, convert_state_dict_for_explicit_attention
+from .adapter import JinaToSDXLAdapterV3, build_adapter, convert_state_dict_for_explicit_attention
+from .compat import (
+    ensure_flash_attn_bypass,
+    ensure_legacy_clip_symbols,
+    force_local_files_only_for_transformers,
+    ignore_none_code_revision_for_auto_model_from_config,
+    pretrained_dtype_kwargs,
+    repair_jina_clip_nonpersistent_buffers,
+    validate_jina_tokenizer,
+)
 
 logger = logging.getLogger("JinaCLIP-SDXL")
-
-
-def ensure_flash_attn_bypass():
-    try:
-        from flash_attn.ops.triton.rotary import apply_rotary  # noqa: F401
-        return
-    except Exception:
-        pass
-
-    for key in [k for k in sys.modules if k.startswith("flash_attn")]:
-        del sys.modules[key]
 
 
 def dtype_from_name(name, device=None):
@@ -55,18 +53,40 @@ def device_from_name(name):
     return torch.device(name)
 
 
-def _from_pretrained(cls, model_id, local_files_only):
-    kwargs = dict(
-        trust_remote_code=True,
-        local_files_only=local_files_only,
-    )
-    try:
-        return cls.from_pretrained(model_id, fix_mistral_regex=True, **kwargs)
-    except TypeError:
-        return cls.from_pretrained(model_id, **kwargs)
+def _sequence_tensor(output):
+    if hasattr(output, "last_hidden_state"):
+        output = output.last_hidden_state
+    elif isinstance(output, (tuple, list)):
+        output = output[0]
+    if not isinstance(output, torch.Tensor):
+        raise RuntimeError("Jina's text transformer did not return a tensor sequence.")
+    return output
+
+
+def _restore_sequence(state, attention_mask, label):
+    """Restore Jina implementations that emit only valid tokens to [B, L, D]."""
+    while state.ndim > 3 and state.shape[0] == 1:
+        state = state.squeeze(0)
+    batch, sequence = attention_mask.shape
+    if state.ndim == 3:
+        if tuple(state.shape[:2]) != (batch, sequence):
+            raise RuntimeError(f"{label} has shape {tuple(state.shape)}, expected [{batch}, {sequence}, D].")
+        return state
+    if state.ndim != 2:
+        raise RuntimeError(f"{label} must be [B, L, D] or [valid_tokens, D], got {tuple(state.shape)}.")
+    if state.shape[0] == batch * sequence:
+        return state.reshape(batch, sequence, state.shape[-1])
+    valid = attention_mask.to(device=state.device, dtype=torch.bool)
+    if state.shape[0] != int(valid.sum().item()):
+        raise RuntimeError(f"{label} cannot be restored from the supplied attention mask.")
+    restored = state.new_zeros(batch, sequence, state.shape[-1])
+    restored[valid] = state
+    return restored
 
 
 class JinaStates:
+    selected_layers = JinaToSDXLAdapterV3.required_hidden_state_layers
+
     def __init__(self, model_id, device, dtype, max_length=512, local_files_only=False):
         from transformers import AutoModel, AutoTokenizer
 
@@ -75,18 +95,35 @@ class JinaStates:
         self.dtype = dtype
         self.max_length = int(max_length)
 
-        logger.info("Loading Jina tokenizer from %s", model_id)
-        self.tokenizer = _from_pretrained(AutoTokenizer, model_id, local_files_only)
+        with ExitStack() as load_context:
+            load_context.enter_context(ignore_none_code_revision_for_auto_model_from_config())
+            if local_files_only:
+                load_context.enter_context(force_local_files_only_for_transformers())
 
-        logger.info("Loading Jina CLIP v2 from %s", model_id)
-        ensure_flash_attn_bypass()
-        self.model = AutoModel.from_pretrained(
-            model_id,
-            low_cpu_mem_usage=False,
-            torch_dtype=dtype,
-            trust_remote_code=True,
-            local_files_only=local_files_only,
-        )
+            logger.info("Loading Jina tokenizer from %s", model_id)
+            self.tokenizer = AutoTokenizer.from_pretrained(
+                model_id,
+                trust_remote_code=True,
+                local_files_only=local_files_only,
+                # V2 and V3 adapters were trained with the original Jina
+                # XLM-R token boundaries, not Transformers' Mistral repair.
+                fix_mistral_regex=False,
+            )
+            validate_jina_tokenizer(self.tokenizer)
+
+            logger.info("Loading Jina CLIP v2 from %s", model_id)
+            ensure_flash_attn_bypass()
+            ensure_legacy_clip_symbols()
+            self.model = AutoModel.from_pretrained(
+                model_id,
+                low_cpu_mem_usage=False,
+                trust_remote_code=True,
+                local_files_only=local_files_only,
+                **pretrained_dtype_kwargs(dtype),
+            )
+        buffer_repairs = repair_jina_clip_nonpersistent_buffers(self.model)
+        if buffer_repairs["repaired"]:
+            logger.info("Repaired %d Jina non-persistent buffers after loading", buffer_repairs["repaired"])
         self.model.to(self.device)
 
         if hasattr(self.model, "vision_model"):
@@ -97,8 +134,14 @@ class JinaStates:
         self.model.requires_grad_(False)
 
         self.hidden_states_cache = None
-        self.encoder_module = self._find_text_encoder_module()
+        self.selected_state_cache = [None] * len(self.selected_layers)
+        self.encoder_module, self.layer_list = self._find_text_encoder_module()
         self.encoder_module.register_forward_hook(self._forward_hook)
+        for cache_index, layer_number in enumerate(self.selected_layers):
+            def layer_hook(_module, _args, output, cache_index=cache_index):
+                self.selected_state_cache[cache_index] = _sequence_tensor(output)
+
+            self.layer_list[layer_number - 1].register_forward_hook(layer_hook)
         logger.info("Attached Jina hidden-state hook to %s", self.encoder_module.__class__.__name__)
 
     def _find_text_encoder_module(self):
@@ -108,18 +151,13 @@ class JinaStates:
 
             for attr in ("layer", "layers", "block", "blocks"):
                 layer_list = getattr(module, attr, None)
-                if isinstance(layer_list, torch.nn.ModuleList) and len(layer_list) > 1:
-                    return module
+                if isinstance(layer_list, torch.nn.ModuleList) and len(layer_list) >= self.selected_layers[-1]:
+                    return module, layer_list
 
-        raise RuntimeError("Could not identify Jina CLIP v2 text encoder module for hidden-state hook.")
+        raise RuntimeError("Could not locate Jina CLIP v2's 24-layer text transformer.")
 
     def _forward_hook(self, module, args, output):
-        if hasattr(output, "last_hidden_state"):
-            self.hidden_states_cache = output.last_hidden_state
-        elif isinstance(output, tuple):
-            self.hidden_states_cache = output[0]
-        else:
-            self.hidden_states_cache = output
+        self.hidden_states_cache = _sequence_tensor(output)
 
     def to(self, device=None, dtype=None):
         if device is not None:
@@ -139,27 +177,49 @@ class JinaStates:
     @torch.inference_mode()
     def run(self, input_ids, attention_mask, output_dtype=torch.float32):
         self.hidden_states_cache = None
-
-        if hasattr(self.model, "get_text_features"):
-            pooled = self.model.get_text_features(input_ids=input_ids, attention_mask=attention_mask)
-        else:
-            out = self.model.text_model(input_ids=input_ids, attention_mask=attention_mask)
-            if hasattr(out, "text_embeds"):
-                pooled = out.text_embeds
-            elif hasattr(out, "pooler_output"):
-                pooled = out.pooler_output
-            elif isinstance(out, tuple):
-                pooled = out[1] if len(out) > 1 else out[0]
+        self.selected_state_cache = [None] * len(self.selected_layers)
+        try:
+            if hasattr(self.model, "get_text_features"):
+                pooled = self.model.get_text_features(input_ids=input_ids, attention_mask=attention_mask)
             else:
-                pooled = out
+                out = self.model.text_model(input_ids=input_ids, attention_mask=attention_mask)
+                if hasattr(out, "text_embeds"):
+                    pooled = out.text_embeds
+                elif hasattr(out, "pooler_output"):
+                    pooled = out.pooler_output
+                elif isinstance(out, tuple):
+                    pooled = out[1] if len(out) > 1 else out[0]
+                else:
+                    pooled = out
 
-        if self.hidden_states_cache is None:
-            raise RuntimeError("Jina hidden-state hook did not capture sequence states.")
+            if self.hidden_states_cache is None or any(state is None for state in self.selected_state_cache):
+                raise RuntimeError("Jina hooks did not capture h8, h16, h24, and the final text state.")
 
-        if not isinstance(pooled, torch.Tensor):
-            pooled = self.mean_pooling(self.hidden_states_cache, attention_mask)
+            final_state = _restore_sequence(
+                self.hidden_states_cache,
+                attention_mask,
+                "Jina final text state",
+            )
+            selected = torch.stack(
+                [
+                    _restore_sequence(state, attention_mask, f"Jina text layer h{layer}")
+                    for layer, state in zip(self.selected_layers, self.selected_state_cache)
+                ],
+                dim=1,
+            )
+            # Training uses the encoder's final normalized state for h24.
+            selected = torch.cat([selected[:, :-1], final_state.unsqueeze(1)], dim=1)
+            if not isinstance(pooled, torch.Tensor) or pooled.ndim != 2:
+                pooled = self.mean_pooling(final_state, attention_mask)
 
-        return self.hidden_states_cache.clone().to(output_dtype), pooled.clone().to(output_dtype)
+            return (
+                final_state.clone().to(output_dtype),
+                selected.clone().to(output_dtype),
+                pooled.clone().to(output_dtype),
+            )
+        finally:
+            self.hidden_states_cache = None
+            self.selected_state_cache = [None] * len(self.selected_layers)
 
 
 def format_artist_tags(text):
@@ -264,6 +324,7 @@ def get_token_data(tokenizer, text, char_weights, device, padding_mode, max_leng
 class JinaConfig:
     model_id: str
     adapter_path: str
+    adapter_version: str = "auto"
     device_name: str = "auto"
     dtype_name: str = "auto"
     max_length: int = 512
@@ -322,6 +383,7 @@ class JinaConditioningManager:
         key = (
             adapter_path,
             str(device),
+            str(cfg.adapter_version),
             int(cfg.adapter_seq_len),
             bool(cfg.attn_pooling),
             bool(cfg.use_positional),
@@ -333,27 +395,24 @@ class JinaConditioningManager:
             return self.adapter
 
         logger.info("Loading Jina SDXL adapter from %s", adapter_path)
-        adapter = JinaToSDXLAdapterV2(
-            llm_dim=1024,
-            sdxl_seq_dim=2048,
-            sdxl_pooled_dim=1280,
-            n_attention_blocks=4,
-            num_heads=16,
-            dropout=0,
-            max_seq_len=int(cfg.adapter_seq_len),
-            attn_pooling=bool(cfg.attn_pooling),
-            use_positional=bool(cfg.use_positional),
-        )
         checkpoint = load_file(adapter_path, device="cpu")
         if cfg.convert_legacy_mha:
             checkpoint = convert_state_dict_for_explicit_attention(checkpoint)
-        missing, unexpected = adapter.load_state_dict(checkpoint, strict=False)
+        adapter, detected_version, missing, unexpected = build_adapter(
+            checkpoint,
+            requested_version=cfg.adapter_version,
+            v2_max_seq_len=cfg.adapter_seq_len,
+            v2_attn_pooling=cfg.attn_pooling,
+            v2_use_positional=cfg.use_positional,
+        )
         if missing:
-            logger.warning("Jina adapter missing %d keys; first few: %s", len(missing), list(missing)[:8])
+            logger.warning("Jina V2 adapter missing %d keys; first few: %s", len(missing), list(missing)[:8])
         if unexpected:
-            logger.warning("Jina adapter ignored %d unexpected keys; first few: %s", len(unexpected), list(unexpected)[:8])
+            logger.warning("Jina V2 adapter ignored %d unexpected keys; first few: %s", len(unexpected), list(unexpected)[:8])
         adapter.to(device)
         adapter.eval()
+        adapter.requires_grad_(False)
+        logger.info("Loaded Jina SDXL adapter architecture %s", detected_version.upper())
 
         self.adapter = adapter
         self.adapter_key = key
@@ -388,8 +447,9 @@ class JinaConditioningManager:
         output_dtype = torch.float32
 
         def run(ids, mask):
-            hidden, pooled = jina.run(ids, mask, output_dtype=output_dtype)
-            return adapter(hidden.to(torch.float32), pooled.to(torch.float32), mask.to(torch.float32))
+            final_state, selected, pooled = jina.run(ids, mask, output_dtype=output_dtype)
+            sequence_input = selected if adapter.adapter_version == "v3" else final_state
+            return adapter(sequence_input.to(torch.float32), pooled.to(torch.float32), mask.to(torch.float32))
 
         prompt_embeds, pooled = run(input_ids, attention_mask)
 
@@ -486,8 +546,10 @@ class JinaConditioningManager:
             vector=torch.cat([pooled, flat], dim=1),
         )
 
+        detected_version = getattr(self.adapter, "adapter_version", "v2").upper()
         engine.extra_generation_params["Jina CLIP v2"] = "enabled"
         engine.extra_generation_params["Jina adapter"] = os.path.basename(cfg.adapter_path)
+        engine.extra_generation_params["Jina adapter version"] = detected_version
         engine.extra_generation_params["Jina tokens"] = "; ".join(infos[:2])
         return cond
 
