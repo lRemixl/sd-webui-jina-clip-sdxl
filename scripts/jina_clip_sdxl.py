@@ -39,6 +39,7 @@ def _is_mugen_like(model):
 def _build_config(
     model_id,
     adapter_path,
+    adapter_version,
     device_name,
     dtype_name,
     max_length,
@@ -55,6 +56,7 @@ def _build_config(
     return JinaConfig(
         model_id=resolve_jina_model_path(model_id),
         adapter_path=resolve_adapter_path(adapter_path),
+        adapter_version=adapter_version,
         device_name=device_name,
         dtype_name=dtype_name,
         max_length=int(max_length),
@@ -74,13 +76,13 @@ class JinaClipSDXLScript(scripts.Script):
     sorting_priority = 20
 
     def title(self):
-        return "Jina CLIP v2 SDXL Adapter"
+        return "Jina CLIP v2 SDXL Adapter (V2/V3)"
 
     def show(self, is_img2img):
         return scripts.AlwaysVisible
 
     def ui(self, is_img2img):
-        with gr.Accordion("Jina CLIP v2 SDXL Adapter", open=False):
+        with gr.Accordion("Jina CLIP v2 SDXL Adapter (V2/V3)", open=False):
             enabled = gr.Checkbox(False, label="Enabled")
             model_choices = find_jina_models()
             model_default = default_jina_model_path()
@@ -103,6 +105,11 @@ class JinaClipSDXLScript(scripts.Script):
                 value=adapter_default,
                 allow_custom_value=True,
             )
+            adapter_version = gr.Dropdown(
+                label="Adapter architecture",
+                choices=["auto", "v2", "v3"],
+                value="auto",
+            )
             with gr.Row():
                 device_name = gr.Dropdown(
                     label="Device",
@@ -123,10 +130,10 @@ class JinaClipSDXLScript(scripts.Script):
                 padding_mode = gr.Dropdown(
                     label="Padding",
                     choices=["none", "Nearest-77", "539", "1078"],
-                    value="Nearest-77 Chunk",
+                    value="Nearest-77",
                 )
                 adapter_seq_len = gr.Dropdown(
-                    label="Adapter max seq len",
+                    label="V2 adapter max seq len",
                     choices=["539", "1078"],
                     value="1078",
                 )
@@ -136,8 +143,8 @@ class JinaClipSDXLScript(scripts.Script):
                     value="comfy",
                 )
             with gr.Row():
-                attn_pooling = gr.Checkbox(True, label="Attention pooled vector")
-                use_positional = gr.Checkbox(False, label="Use positional embeddings")
+                attn_pooling = gr.Checkbox(True, label="V2 attention pooled vector")
+                use_positional = gr.Checkbox(False, label="V2 positional embeddings")
                 format_tags = gr.Checkbox(True, label="Format @ tags")
             with gr.Row():
                 cross_attention_mask = gr.Checkbox(True, label="Cross-attention padding mask")
@@ -147,12 +154,13 @@ class JinaClipSDXLScript(scripts.Script):
                     value="fp16_triton",
                 )
                 local_files_only = gr.Checkbox(False, label="Local files only")
-                convert_legacy_mha = gr.Checkbox(False, label="Convert legacy MHA adapter")
+                convert_legacy_mha = gr.Checkbox(False, label="Convert legacy fused-MHA adapter")
 
         self.infotext_fields = [
             (enabled, "Jina CLIP v2"),
             (model_id, "Jina model"),
             (adapter_path, "Jina adapter"),
+            (adapter_version, "Jina adapter version"),
             (padding_mode, "Jina padding"),
             (weighting_mode, "Jina weighting"),
             (sage_attention_override, "Jina SageAttention override"),
@@ -162,6 +170,7 @@ class JinaClipSDXLScript(scripts.Script):
             enabled,
             model_id,
             adapter_path,
+            adapter_version,
             device_name,
             dtype_name,
             max_length,
@@ -190,11 +199,27 @@ class JinaClipSDXLScript(scripts.Script):
         if not _is_mugen_like(model):
             raise RuntimeError("Jina CLIP v2 SDXL Adapter expects a loaded Mugen/SDXL-like checkpoint.")
 
-        cfg = _build_config(*args[1:13], *args[14:])
+        cfg = _build_config(
+            model_id=args[1],
+            adapter_path=args[2],
+            adapter_version=args[3],
+            device_name=args[4],
+            dtype_name=args[5],
+            max_length=args[6],
+            padding_mode=args[7],
+            weighting_mode=args[8],
+            adapter_seq_len=args[9],
+            attn_pooling=args[10],
+            use_positional=args[11],
+            format_tags=args[12],
+            cross_attention_mask=args[13],
+            local_files_only=args[15],
+            convert_legacy_mha=args[16],
+        )
         if not cfg.model_id:
             raise ValueError("Enter a Jina model path or Hugging Face id.")
 
-        sage_attention_override = args[13]
+        sage_attention_override = args[14]
         apply_sage_override(sage_attention_override)
         install_global_patches()
         patch_model_conditioning(model, cfg, manager)
@@ -205,6 +230,7 @@ class JinaClipSDXLScript(scripts.Script):
         p.extra_generation_params["Jina CLIP v2"] = "enabled"
         p.extra_generation_params["Jina model"] = os.path.basename(cfg.model_id.rstrip("\\/")) or cfg.model_id
         p.extra_generation_params["Jina adapter"] = os.path.basename(cfg.adapter_path)
+        p.extra_generation_params["Jina adapter version"] = cfg.adapter_version.upper()
         p.extra_generation_params["Jina padding"] = cfg.padding_mode
         p.extra_generation_params["Jina weighting"] = cfg.weighting_mode
         if sage_attention_override != "off":

@@ -37,7 +37,7 @@ def install_mugen_loader_patch():
             ):
                 logger.warning(
                     "Skipping missing %s for Jina-only Mugen checkpoint. "
-                    "Enable the Jina CLIP v2 SDXL Adapter extension for prompt conditioning.",
+                    "Enable the Jina CLIP v2 SDXL Adapter (V2/V3) extension for prompt conditioning.",
                     component_name,
                 )
                 return None
@@ -111,7 +111,7 @@ def install_mugen_loader_patch():
         if getattr(self, "text_processing_engine_l", None) is None:
             raise RuntimeError(
                 "This Mugen checkpoint does not include SDXL CLIP weights. "
-                "Enable the 'Jina CLIP v2 SDXL Adapter' extension panel and provide the Jina model + adapter paths."
+                "Enable the 'Jina CLIP v2 SDXL Adapter (V2/V3)' extension panel and provide the Jina model + adapter paths."
             )
         return original_get_learned_conditioning(self, prompt)
 
@@ -120,4 +120,3 @@ def install_mugen_loader_patch():
     Mugen.get_prompt_lengths_on_ui = get_prompt_lengths_on_ui_jina_safe
     Mugen.get_learned_conditioning = get_learned_conditioning_jina_safe
     Mugen._jina_missing_clip_patch_installed = True
-
