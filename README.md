@@ -1,10 +1,11 @@
 # Jina CLIP v2 SDXL Adapter V2/V3 for Forge Neo
+## Fully vibecoded
 
 This Forge extension replaces SDXL/Mugen prompt conditioning with Jina CLIP v2 plus either a V2 or redesigned V3 Jina-to-SDXL adapter.
 
 This extension adds support for jina-clip-v2 adapter as a text encoder for Mugen.
 - [jina-clip-v2](https://huggingface.co/jinaai/jina-clip-v2)
-- [Adapter+UNet](https://huggingface.co/TheRemixer/Mugen-Jina-V1.5)
+- [Adapter+UNet](https://huggingface.co/TheRemixer/Mugen-Jina-V2.0)
 
 Place or clone this directory under Forge Neo's `extensions/` directory, then restart Forge.
 
