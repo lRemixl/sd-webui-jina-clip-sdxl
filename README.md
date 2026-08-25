@@ -2,7 +2,9 @@
 
 This Forge extension replaces SDXL/Mugen prompt conditioning with Jina CLIP v2 plus either a V2 or redesigned V3 Jina-to-SDXL adapter.
 
-## Installation
+This extension adds support for jina-clip-v2 adapter as a text encoder for Mugen.
+- [jina-clip-v2](https://huggingface.co/jinaai/jina-clip-v2)
+- [Adapter+UNet](https://huggingface.co/TheRemixer/Mugen-Jina-V1.5)
 
 Place or clone this directory under Forge Neo's `extensions/` directory, then restart Forge.
 
